@@ -1,0 +1,3 @@
+import memmon
+
+memmon.start()
