@@ -9,6 +9,7 @@ from datetime import datetime
 import psutil
 
 _started = False
+HEADER = "время;память_МБ;процессор_%;потоки;соединения"
 
 
 def _rss_mb(proc, children):
@@ -43,7 +44,8 @@ def start(interval=None, path=None, children=True, trace=None):
         trace = os.getenv("MEMMON_TRACE") == "1"
 
     proc = psutil.Process()
-    peak = [0.0]
+    t0 = time.time()
+    stats = {"first": None, "last": None, "peak": 0.0, "t_first": None, "t_last": None}
 
     if trace:
         tracemalloc.start(5)
@@ -52,17 +54,27 @@ def start(interval=None, path=None, children=True, trace=None):
         with open(file, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
+    # BOM нужен, чтобы Excel правильно показал русские буквы в заголовке
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "a", encoding="utf-8-sig") as f:
+            f.write(HEADER + "\n")
+
     def loop():
         proc.cpu_percent(None)
         prev = None
-        write("time;rss_mb;peak_mb;cpu_pct;threads;connections")
         while True:
             time.sleep(interval)
             try:
                 rss = _rss_mb(proc, children)
-                peak[0] = max(peak[0], rss)
+                now = time.time()
+                if stats["first"] is None:
+                    stats["first"] = rss
+                    stats["t_first"] = now
+                stats["last"] = rss
+                stats["t_last"] = now
+                stats["peak"] = max(stats["peak"], rss)
                 write(
-                    f"{datetime.now():%H:%M:%S};{rss:.1f};{peak[0]:.1f};"
+                    f"{datetime.now():%H:%M:%S};{rss:.1f};"
                     f"{proc.cpu_percent(None):.0f};{proc.num_threads()};{_conn_count(proc)}"
                 )
                 if trace:
@@ -71,7 +83,7 @@ def start(interval=None, path=None, children=True, trace=None):
                         for s in snap.compare_to(prev, "traceback")[:5]:
                             if s.size_diff > 0:
                                 write(
-                                    f"[{datetime.now():%H:%M:%S}] +{s.size_diff/1024:.0f} KB, "
+                                    f"[{datetime.now():%H:%M:%S}] +{s.size_diff/1024:.0f} КБ, "
                                     f"{s.count_diff} объектов\n"
                                     + "\n".join("   " + l for l in s.traceback.format(limit=4)),
                                     path + ".trace.txt",
@@ -80,7 +92,23 @@ def start(interval=None, path=None, children=True, trace=None):
             except psutil.NoSuchProcess:
                 break
             except Exception as e:
-                write(f"# monitor error: {e}")
+                write(f"# ошибка монитора: {e}")
+
+    def finish():
+        if stats["first"] is None:
+            write("# замеров не было: программа проработала меньше одного интервала")
+            return
+        minutes = (time.time() - t0) / 60
+        span = (stats["t_last"] - stats["t_first"]) / 60
+        if span >= 1:
+            growth = f"{(stats['last'] - stats['first']) / span:+.2f} МБ/мин"
+        else:
+            growth = "не считается (замер короче минуты)"
+        write(
+            f"# ИТОГ: первый замер {stats['first']:.1f} МБ; пик {stats['peak']:.1f} МБ; "
+            f"последний {stats['last']:.1f} МБ; рост {growth}; "
+            f"работала {minutes:.1f} мин"
+        )
 
     threading.Thread(target=loop, daemon=True, name="memmon").start()
-    atexit.register(lambda: write(f"# peak_mb={peak[0]:.1f}"))
+    atexit.register(finish)
