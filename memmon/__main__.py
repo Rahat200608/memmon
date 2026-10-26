@@ -14,9 +14,9 @@ def main():
         plot.main(sys.argv[2:])
         return
 
+    sys.argv = sys.argv[1:]      # сначала подменяем argv, чтобы имя файла отчёта взялось от скрипта
     import memmon
     memmon.start()
-    sys.argv = sys.argv[1:]
     runpy.run_path(sys.argv[0], run_name="__main__")
 
 
