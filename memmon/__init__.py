@@ -1,6 +1,8 @@
 """memmon - универсальный монитор памяти/CPU для любой Python-программы."""
 import atexit
 import os
+import re
+import sys
 import threading
 import time
 import tracemalloc
@@ -9,6 +11,7 @@ from datetime import datetime
 import psutil
 
 _started = False
+_config = {}
 HEADER = "время;память_МБ;процессор_%;потоки;соединения"
 
 
@@ -31,17 +34,32 @@ def _conn_count(proc):
         return -1
 
 
+def _script_name():
+    arg = sys.argv[0] if sys.argv and sys.argv[0] else "python"
+    name = os.path.splitext(os.path.basename(arg))[0] or "python"
+    return re.sub(r"[^\w\-]", "_", name)
+
+
 def start(interval=None, path=None, children=True, trace=None):
-    """Запускает фоновый замер. Повторный вызов ничего не делает."""
+    """Запускает фоновый замер. Повторный вызов настроек не меняет."""
     global _started
     if _started:
+        if any(v is not None for v in (interval, path, trace)):
+            print(
+                f"[memmon] уже запущен (интервал {_config['interval']:g} с, трассировка "
+                f"{'вкл' if _config['trace'] else 'выкл'}). Новые настройки проигнорированы: "
+                "убери лишний `import memmon.auto` или поставь свой memmon.start(...) раньше него.",
+                file=sys.stderr,
+            )
         return
     _started = True
 
     interval = float(interval or os.getenv("MEMMON_INTERVAL", 10))
-    path = path or os.getenv("MEMMON_FILE", f"memmon_{os.getpid()}.csv")
+    name = _script_name()
+    path = path or os.getenv("MEMMON_FILE", f"memmon_{name}_{os.getpid()}.csv")
     if trace is None:
         trace = os.getenv("MEMMON_TRACE") == "1"
+    _config.update(interval=interval, trace=trace)
 
     proc = psutil.Process()
     t0 = time.time()
@@ -58,6 +76,11 @@ def start(interval=None, path=None, children=True, trace=None):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         with open(path, "a", encoding="utf-8-sig") as f:
             f.write(HEADER + "\n")
+    write(
+        f"# процесс: {name} (PID {os.getpid()}); интервал {interval:g} с; "
+        f"трассировка {'вкл, отчёт в ' + path + '.trace.txt' if trace else 'выкл'}; "
+        f"дочерние процессы {'учитываются' if children else 'не учитываются'}"
+    )
 
     def loop():
         proc.cpu_percent(None)
