@@ -34,6 +34,28 @@ def _conn_count(proc):
         return -1
 
 
+def _place(frame):
+    """Короткое место в коде: файл:строка (без длинных путей)."""
+    f = frame.filename.replace("\\", "/")
+    for marker in ("site-packages/", "/Lib/"):
+        if marker in f:
+            f = f.split(marker, 1)[1]
+            break
+    else:
+        f = os.path.basename(f)
+    return f"{f}:{frame.lineno}"
+
+
+def _noise_filters():
+    """Не показываем места, которые относятся к самой трассировке."""
+    return [
+        tracemalloc.Filter(False, tracemalloc.__file__),
+        tracemalloc.Filter(False, __file__),
+        tracemalloc.Filter(False, "*linecache.py"),
+        tracemalloc.Filter(False, "<frozen *"),
+    ]
+
+
 def _script_name():
     arg = sys.argv[0] if sys.argv and sys.argv[0] else "python"
     name = os.path.splitext(os.path.basename(arg))[0] or "python"
@@ -65,8 +87,17 @@ def start(interval=None, path=None, children=True, trace=None):
     t0 = time.time()
     stats = {"first": None, "last": None, "peak": 0.0, "t_first": None, "t_last": None}
 
+    tr = {"base": None, "last": None}
+    tpath = path + ".trace.txt"
     if trace:
         tracemalloc.start(5)
+        with open(tpath, "a", encoding="utf-8") as f:
+            f.write(
+                "# Как читать: каждая строка это место в коде, где память выросла С НАЧАЛА замера "
+                "(не за последний интервал).\n"
+                "# Если одно и то же место растёт из замера в замер, это кандидат на утечку.\n"
+                "# Строки самой трассировки (memmon, tracemalloc, linecache) и мелочи меньше 10 КБ скрыты.\n"
+            )
 
     def write(line, file=path):
         with open(file, "a", encoding="utf-8") as f:
@@ -101,23 +132,34 @@ def start(interval=None, path=None, children=True, trace=None):
                     f"{proc.cpu_percent(None):.0f};{proc.num_threads()};{_conn_count(proc)}"
                 )
                 if trace:
-                    snap = tracemalloc.take_snapshot()
-                    if prev is not None:
-                        for s in snap.compare_to(prev, "traceback")[:5]:
-                            if s.size_diff > 0:
-                                write(
-                                    f"[{datetime.now():%H:%M:%S}] +{s.size_diff/1024:.0f} КБ, "
-                                    f"{s.count_diff} объектов\n"
-                                    + "\n".join("   " + l for l in s.traceback.format(limit=4)),
-                                    path + ".trace.txt",
-                                )
-                    prev = snap
+                    snap = tracemalloc.take_snapshot().filter_traces(_noise_filters())
+                    if tr["base"] is None:
+                        tr["base"] = snap
+                    else:
+                        tr["last"] = snap
+                        top = [d for d in snap.compare_to(tr["base"], "lineno") if d.size_diff > 10240][:5]
+                        for d in top:
+                            write(
+                                f"[{datetime.now():%H:%M:%S}] {_place(d.traceback[0])}: "
+                                f"+{d.size_diff/1024:.0f} КБ всего, +{d.count_diff} объектов",
+                                tpath,
+                            )
             except psutil.NoSuchProcess:
                 break
             except Exception as e:
                 write(f"# ошибка монитора: {e}")
 
+    def finish_trace():
+        if not (trace and tr["base"] is not None and tr["last"] is not None):
+            return
+        write("\n# ИТОГ ТРАССИРОВКИ: топ-3 места по росту памяти за весь замер (внизу вызов, где выделена память)", tpath)
+        top = [d for d in tr["last"].compare_to(tr["base"], "traceback") if d.size_diff > 10240][:3]
+        for i, d in enumerate(top, 1):
+            write(f"{i}. +{d.size_diff/1024:.0f} КБ, +{d.count_diff} объектов", tpath)
+            write("\n".join("     " + l for l in d.traceback.format(limit=4)), tpath)
+
     def finish():
+        finish_trace()
         if stats["first"] is None:
             write("# замеров не было: программа проработала меньше одного интервала")
             return
